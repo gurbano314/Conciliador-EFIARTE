@@ -137,10 +137,10 @@ def extract_fields(text: str) -> dict:
 
     # --- Nombre del proyecto ---
     fields["nombre_proyecto"] = _find_after_label(text, [
+        r"nombre\s+del\s+proyecto\s*:?",
         r"t[\u00ed]tulo\s+del\s+proyecto\s*:?",
         r"proyecto\s+de\s+inversi[o\u00f3]n\s+denominado\s+",
         r"proyecto\s+denominado\s+",
-        r"nombre\s+del\s+proyecto\s*:?",
         r"proyecto\s*:\s*",
     ])
     # Si no encontrado con etiqueta, busca en mayúsculas entre comillas

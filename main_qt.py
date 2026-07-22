@@ -1415,6 +1415,27 @@ class MainWindow(QMainWindow):
         ws.row_dimensions[1].height = 32
         ws.freeze_panes = "A2"
 
+        # Autofilters para todas las columnas
+        ws.auto_filter.ref = ws.dimensions
+
+        # Validaciones de datos (Listas desplegables)
+        from openpyxl.worksheet.datavalidation import DataValidation
+
+        if ws.max_row > 1:
+            # Dictamen (Columna 20 / T)
+            dv_dictamen = DataValidation(type="list", formula1='"Aprobado,Con Prevención,Rechazado"', allow_blank=True)
+            dv_dictamen.error = 'Selecciona un valor de la lista.'
+            dv_dictamen.errorTitle = 'Valor inválido'
+            ws.add_data_validation(dv_dictamen)
+            dv_dictamen.add(f"T2:T{ws.max_row}")
+
+            # Revisado (Columna 22 / V)
+            dv_revisado = DataValidation(type="list", formula1='"Sí,No"', allow_blank=True)
+            dv_revisado.error = 'Selecciona Sí o No.'
+            dv_revisado.errorTitle = 'Valor inválido'
+            ws.add_data_validation(dv_revisado)
+            dv_revisado.add(f"V2:V{ws.max_row}")
+
         wb.save(path)
 
     # ── Cierre ──────────────────────────────────────────────
