@@ -165,16 +165,14 @@ def extract_fields(text: str) -> dict:
             fields["nombre_erpi"] = erpi_raw
 
     # --- Etapa ---
-    etapa_val = _find_after_label(text, [r"etapa\s*:?\s*", r"etapa de desarrollo\s*:?"])
+    etapa_val = _find_after_label(text, [
+        r"etapa(?: de desarrollo)?(?: del proyecto(?: de inversi[\u00f3o]n)?)?\s*:?",
+        r"etapa\s*:?\s*"
+    ])
     if etapa_val:
-        # Tomar solo las primeras palabras, limpiar texto extra
+        # Tomar solo la primera línea
         etapa_val = re.split(r'[\n\r]', etapa_val)[0].strip()
-        # Si empieza con "del proyecto" o similar, extraer la etapa real
-        m_etapa = re.search(
-            r'(producci[\u00f3o]n|estreno|circulaci[\u00f3o]n nacional|posproducci[\u00f3o]n|desarrollo)',
-            etapa_val, re.IGNORECASE
-        )
-        fields["etapa"] = m_etapa.group(1).capitalize() if m_etapa else etapa_val[:40]
+        fields["etapa"] = etapa_val[:120]
     else:
         # Buscar etapa directamente en texto
         text_lower = text.lower()

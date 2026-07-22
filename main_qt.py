@@ -307,6 +307,37 @@ class SaveWorker(QThread):
 # VISOR PDF (reuso del Conciliador)
 # ─────────────────────────────────────────────────────────────
 
+class PanLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._is_panning = False
+        self._pan_start_x = 0
+        self._pan_start_y = 0
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._is_panning = True
+            self._pan_start_x = e.pos().x()
+            self._pan_start_y = e.pos().y()
+
+    def mouseMoveEvent(self, e):
+        if self._is_panning:
+            dx = e.pos().x() - self._pan_start_x
+            dy = e.pos().y() - self._pan_start_y
+            w = self.parentWidget()
+            while w and not isinstance(w, QScrollArea):
+                w = w.parentWidget()
+            if w:
+                w.horizontalScrollBar().setValue(w.horizontalScrollBar().value() - dx)
+                w.verticalScrollBar().setValue(w.verticalScrollBar().value() - dy)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._is_panning = False
+
 class PDFViewer(QWidget):
     """Visor PDF con controles completos estilo Conciliador."""
 
@@ -455,7 +486,7 @@ class PDFViewer(QWidget):
         self.scroll.setStyleSheet(f"background:{C_BG}; border:none;")
         self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.lbl_img = QLabel()
+        self.lbl_img = PanLabel()
         self.lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_img.setStyleSheet(
             f"background:{C_BG}; padding:16px;"
