@@ -137,24 +137,33 @@ def extract_fields(text: str) -> dict:
 
     # --- Nombre del proyecto ---
     fields["nombre_proyecto"] = _find_after_label(text, [
-        r"nombre del proyecto\s*:?",
-        r"proyecto(?:\s+de\s+inversi[o\u00f3]n)?\s+denominado\s+",
+        r"t[\u00ed]tulo\s+del\s+proyecto\s*:?",
+        r"proyecto\s+de\s+inversi[o\u00f3]n\s+denominado\s+",
+        r"proyecto\s+denominado\s+",
+        r"nombre\s+del\s+proyecto\s*:?",
         r"proyecto\s*:\s*",
-        r"t[\u00ed]tulo del proyecto\s*:?",
     ])
     # Si no encontrado con etiqueta, busca en mayúsculas entre comillas
     if not fields["nombre_proyecto"]:
-        m = re.search(r'[\u00ab\u201c\u201d]([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d1][^\u00bb\u201c\u201d\n]{3,80})[\u00bb\u201c\u201d]', text)
+        m = re.search(r'[\u00ab\u201c\u201d"]([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d1][^\u00bb\u201c\u201d"\n]{3,80})[\u00bb\u201c\u201d"]', text)
+        if m:
+            fields["nombre_proyecto"] = m.group(1).strip()
+    if not fields["nombre_proyecto"]:
+        m = re.search(r'proyecto[^\n]{0,80}?[\u00ab\u201c\u201d"]([^"\u00bb\u201d\n]+)[\u00bb\u201c\u201d"]', text, re.IGNORECASE)
+        if m:
+            fields["nombre_proyecto"] = m.group(1).strip()
+    if not fields["nombre_proyecto"]:
+        m = re.search(r'del proyecto\s+([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d10-9\s]{5,80})\.', text)
         if m:
             fields["nombre_proyecto"] = m.group(1).strip()
 
     # --- Nombre de la ERPI ---
     erpi_raw = _find_after_label(text, [
-        r"nombre de la erpi\s*:?",
-        r"(?<![a-z])erpi\s*:\s*",
-        r"empresa responsable del proyecto de inversi[\u00f3o]n\s*:?",
-        r"empresa responsable\s*:?",
+        r"empresa\s+responsable\s+del\s+proyecto\s+de\s+inversi[\u00f3o]n\s*:",
+        r"empresa\s+responsable\s*:",
+        r"nombre\s+de\s+la\s+erpi\s*:?",
         r"empresa\s+productora\s*:?",
+        r"(?<![a-z])erpi\s*:\s*",
     ])
     if erpi_raw:
         # Cortar antes de palabras que indican el inicio de otro campo
@@ -166,7 +175,11 @@ def extract_fields(text: str) -> dict:
 
     # --- Etapa ---
     etapa_val = _find_after_label(text, [
-        r"etapa(?: de desarrollo)?(?: del proyecto(?: de inversi[\u00f3o]n)?)?\s*:?",
+        r"etapa\s+de\s+desarrollo\s+del\s+proyecto\s+de\s+inversi[\u00f3o]n\s*:?",
+        r"etapa\s+de\s+desarrollo\s+del\s+proyecto\s*:?",
+        r"etapa\s+del\s+proyecto\s+de\s+inversi[\u00f3o]n\s*:?",
+        r"etapa\s+del\s+proyecto\s*:?",
+        r"etapa\s+de\s+desarrollo\s*:?",
         r"etapa\s*:?\s*"
     ])
     if etapa_val:
