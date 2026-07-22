@@ -1255,6 +1255,7 @@ class MainWindow(QMainWindow):
             self.btn_save.setEnabled(True)
             self._unsaved = False
             self.status.showMessage(f"Sesión guardada: {p}", 4000)
+            QMessageBox.information(self, "Sesión guardada", f"El proyecto se ha guardado exitosamente en:\n{p}")
 
         def on_err(msg):
             self.btn_save.setEnabled(True)
@@ -1300,6 +1301,7 @@ class MainWindow(QMainWindow):
             self._unsaved = False
             self._update_kpis()
             self.status.showMessage(f"Sesión cargada: {path} — {len(self._reports)} informes.", 4000)
+            QMessageBox.information(self, "Sesión abierta", f"Se ha abierto la sesión exitosamente desde:\n{path}\n\nSe cargaron {len(self._reports)} informes.")
         except Exception as e:
             QMessageBox.critical(self, "Error al abrir", f"No se pudo abrir la sesión:\n{e}")
 

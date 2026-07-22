@@ -145,13 +145,13 @@ def extract_fields(text: str) -> dict:
     ])
     # Si no encontrado con etiqueta, busca en mayúsculas entre comillas
     if not fields["nombre_proyecto"]:
-        m = re.search(r'[\u00ab\u201c\u201d"]([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d1][^\u00bb\u201c\u201d"\n]{3,80})[\u00bb\u201c\u201d"]', text)
+        m = re.search(r'[\u00ab\u201c\u201d"]([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d1][^\u00bb\u201c\u201d"]{3,120})[\u00bb\u201c\u201d"]', text)
         if m:
-            fields["nombre_proyecto"] = m.group(1).strip()
+            fields["nombre_proyecto"] = m.group(1).replace('\n', ' ').replace('\r', ' ').strip()
     if not fields["nombre_proyecto"]:
-        m = re.search(r'proyecto[^\n]{0,80}?[\u00ab\u201c\u201d"]([^"\u00bb\u201d\n]+)[\u00bb\u201c\u201d"]', text, re.IGNORECASE)
+        m = re.search(r'proyecto[^\n]{0,80}?[\u00ab\u201c\u201d"]([^"\u00bb\u201d]+)[\u00bb\u201c\u201d"]', text, re.IGNORECASE)
         if m:
-            fields["nombre_proyecto"] = m.group(1).strip()
+            fields["nombre_proyecto"] = m.group(1).replace('\n', ' ').replace('\r', ' ').strip()
     if not fields["nombre_proyecto"]:
         m = re.search(r'del proyecto\s+([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d10-9\s]{5,80})\.', text)
         if m:
@@ -167,11 +167,15 @@ def extract_fields(text: str) -> dict:
     ])
     if erpi_raw:
         # Cortar antes de palabras que indican el inicio de otro campo
-        erpi_raw = re.split(r'\bEtapa\b|\bPeriodo\b|\bN\u00famero\b|\bRecinto\b', erpi_raw, flags=re.IGNORECASE)[0]
-        erpi_raw = erpi_raw.strip()[:80]
-        # Solo guardar si tiene contenido real (al menos 3 chars alfabéticos)
-        if len(re.sub(r'[^a-zA-Z\u00c0-\u024f]', '', erpi_raw)) >= 3:
+        erpi_raw = re.split(r'(?i)\betapa\b|\bnombre\b|\bdel\b|\bproyecto\b', erpi_raw)[0].strip()
+        # Limpiar caracteres sobrantes al final
+        erpi_raw = re.sub(r'[\.,;:\-—]+$', '', erpi_raw).strip()
+        if erpi_raw:
             fields["nombre_erpi"] = erpi_raw
+    if not fields["nombre_erpi"]:
+        m = re.search(r'suscrit[oa]\s+C\.\s+([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d1\s]{3,80}?)\s+representante\s+legal', text, re.IGNORECASE)
+        if m:
+            fields["nombre_erpi"] = m.group(1).strip()
 
     # --- Etapa ---
     etapa_val = _find_after_label(text, [
