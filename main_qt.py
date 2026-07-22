@@ -308,6 +308,29 @@ class SaveWorker(QThread):
 # ─────────────────────────────────────────────────────────────
 
 class PDFViewer(QWidget):
+    """Visor PDF con controles completos estilo Conciliador."""
+
+    BTN_STYLE = f"""
+        QPushButton {{
+            background: {C_PANEL};
+            color: {C_TEXT};
+            border: 1px solid {C_BORDER};
+            border-radius: 5px;
+            font-size: 14px;
+            font-weight: 700;
+            padding: 0;
+        }}
+        QPushButton:hover {{
+            background: {C_ACCENT};
+            border-color: {C_ACCENT};
+        }}
+        QPushButton:disabled {{
+            color: {C_BORDER};
+            border-color: {C_BORDER};
+            background: {C_BG};
+        }}
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pdf_bytes: bytes = b""
@@ -315,50 +338,149 @@ class PDFViewer(QWidget):
         self._current_page: int = 0
         self._page_cache: dict = {}
         self._zoom = 1.0
+        self._fit_width = False
         self._build()
 
     def _build(self):
-        v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # Toolbar
-        tb = QWidget()
-        tb.setStyleSheet(f"background:{C_PANEL}; border-bottom:1px solid {C_BORDER};")
-        tb_lay = QHBoxLayout(tb)
-        tb_lay.setContentsMargins(8, 4, 8, 4)
-        self.btn_prev = QPushButton("‹")
-        self.btn_prev.setFixedSize(28, 28)
+        # ── Toolbar ──────────────────────────────────────────
+        toolbar = QWidget()
+        toolbar.setFixedHeight(46)
+        toolbar.setStyleSheet(
+            f"background: {C_PANEL};"
+            f"border-bottom: 1px solid {C_BORDER};"
+        )
+        lay = QHBoxLayout(toolbar)
+        lay.setContentsMargins(10, 4, 10, 4)
+        lay.setSpacing(6)
+
+        # Prev / página / Next
+        self.btn_prev = QPushButton("◀")
+        self.btn_prev.setFixedSize(34, 34)
+        self.btn_prev.setStyleSheet(self.BTN_STYLE)
+        self.btn_prev.setToolTip("Página anterior  (←)")
         self.btn_prev.clicked.connect(self._prev_page)
-        self.lbl_page = QLabel("— / —")
-        self.lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_page.setStyleSheet(f"color:{C_MUTED}; font-size:12px; min-width:80px;")
-        self.btn_next = QPushButton("›")
-        self.btn_next.setFixedSize(28, 28)
-        self.btn_next.clicked.connect(self._next_page)
-        self.btn_zoom_in  = QPushButton("+")
-        self.btn_zoom_in.setFixedSize(28, 28)
-        self.btn_zoom_in.clicked.connect(self._zoom_in)
-        self.btn_zoom_out = QPushButton("−")
-        self.btn_zoom_out.setFixedSize(28, 28)
-        self.btn_zoom_out.clicked.connect(self._zoom_out)
-        tb_lay.addWidget(self.btn_prev)
-        tb_lay.addWidget(self.lbl_page)
-        tb_lay.addWidget(self.btn_next)
-        tb_lay.addStretch()
-        tb_lay.addWidget(self.btn_zoom_out)
-        tb_lay.addWidget(self.btn_zoom_in)
-        v.addWidget(tb)
 
-        # Canvas
+        self.le_page = QLineEdit("—")
+        self.le_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.le_page.setFixedWidth(44)
+        self.le_page.setFixedHeight(34)
+        self.le_page.setStyleSheet(
+            f"background:{C_BG}; border:1px solid {C_BORDER}; border-radius:5px;"
+            f"color:{C_TEXT}; font-weight:700; font-size:13px;"
+        )
+        self.le_page.returnPressed.connect(self._on_page_entered)
+
+        self.lbl_total = QLabel("/ —")
+        self.lbl_total.setStyleSheet(f"color:{C_MUTED}; font-size:13px;")
+
+        self.btn_next = QPushButton("▶")
+        self.btn_next.setFixedSize(34, 34)
+        self.btn_next.setStyleSheet(self.BTN_STYLE)
+        self.btn_next.setToolTip("Página siguiente  (→)")
+        self.btn_next.clicked.connect(self._next_page)
+
+        # Separador
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet(f"color:{C_BORDER};")
+        sep.setFixedWidth(1)
+
+        # Zoom out / porcentaje / Zoom in
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setFixedSize(34, 34)
+        self.btn_zoom_out.setStyleSheet(self.BTN_STYLE)
+        self.btn_zoom_out.setToolTip("Alejar  (Ctrl −)")
+        self.btn_zoom_out.clicked.connect(self._zoom_out)
+
+        self.lbl_zoom = QLabel("100%")
+        self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_zoom.setFixedWidth(46)
+        self.lbl_zoom.setStyleSheet(
+            f"color:{C_TEXT}; font-size:12px; font-weight:600;"
+            f"background:{C_BG}; border:1px solid {C_BORDER}; border-radius:5px;"
+            f"padding:4px 0;"
+        )
+
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedSize(34, 34)
+        self.btn_zoom_in.setStyleSheet(self.BTN_STYLE)
+        self.btn_zoom_in.setToolTip("Acercar  (Ctrl +)")
+        self.btn_zoom_in.clicked.connect(self._zoom_in)
+
+        # Separador 2
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet(f"color:{C_BORDER};")
+        sep2.setFixedWidth(1)
+
+        # Ajustar al ancho / Zoom 100%
+        self.btn_fit = QPushButton("⟺")
+        self.btn_fit.setFixedSize(34, 34)
+        self.btn_fit.setStyleSheet(self.BTN_STYLE)
+        self.btn_fit.setToolTip("Ajustar al ancho")
+        self.btn_fit.clicked.connect(self._toggle_fit)
+
+        self.btn_reset_zoom = QPushButton("1:1")
+        self.btn_reset_zoom.setFixedSize(34, 34)
+        self.btn_reset_zoom.setStyleSheet(self.BTN_STYLE)
+        self.btn_reset_zoom.setToolTip("Zoom 100%")
+        self.btn_reset_zoom.clicked.connect(self._reset_zoom)
+
+        lay.addWidget(self.btn_prev)
+        lay.addWidget(self.le_page)
+        lay.addWidget(self.lbl_total)
+        lay.addWidget(self.btn_next)
+        lay.addSpacing(4)
+        lay.addWidget(sep)
+        lay.addSpacing(4)
+        lay.addWidget(self.btn_zoom_out)
+        lay.addWidget(self.lbl_zoom)
+        lay.addWidget(self.btn_zoom_in)
+        lay.addSpacing(4)
+        lay.addWidget(sep2)
+        lay.addSpacing(4)
+        lay.addWidget(self.btn_fit)
+        lay.addWidget(self.btn_reset_zoom)
+        lay.addStretch()
+
+        root.addWidget(toolbar)
+
+        # ── Canvas ───────────────────────────────────────────
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet(f"background:{C_BG}; border:none;")
+        self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.lbl_img = QLabel()
         self.lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_img.setStyleSheet(f"background:{C_BG};")
+        self.lbl_img.setStyleSheet(
+            f"background:{C_BG}; padding:16px;"
+        )
         self.scroll.setWidget(self.lbl_img)
-        v.addWidget(self.scroll)
+        root.addWidget(self.scroll)
+
+        # Teclado
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Right, Qt.Key.Key_Down, Qt.Key.Key_PageDown):
+            self._next_page()
+        elif e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Up, Qt.Key.Key_PageUp):
+            self._prev_page()
+        elif e.key() == Qt.Key.Key_Plus and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._zoom_in()
+        elif e.key() == Qt.Key.Key_Minus and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._zoom_out()
+        elif e.key() == Qt.Key.Key_0 and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._reset_zoom()
+        else:
+            super().keyPressEvent(e)
+
+    # ── Carga ────────────────────────────────────────────────
 
     def load_bytes(self, pdf_bytes: bytes):
         self._pdf_bytes = pdf_bytes
@@ -380,25 +502,53 @@ class PDFViewer(QWidget):
         except Exception:
             self.load_bytes(b"")
 
+    # ── Renderizado ──────────────────────────────────────────
+
     def _render(self):
         if not self._pdf_bytes or self._total_pages == 0:
             self.lbl_img.setText("Sin PDF cargado")
-            self.lbl_page.setText("— / —")
+            self.le_page.setText("—")
+            self.lbl_total.setText("/ —")
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
             return
-        self.lbl_page.setText(f"{self._current_page + 1} / {self._total_pages}")
-        if self._current_page in self._page_cache:
-            self.lbl_img.setPixmap(self._page_cache[self._current_page])
+
+        self.le_page.setText(str(self._current_page + 1))
+        self.lbl_total.setText(f"/ {self._total_pages}")
+        self.btn_prev.setEnabled(self._current_page > 0)
+        self.btn_next.setEnabled(self._current_page < self._total_pages - 1)
+
+        cache_key = (self._current_page, round(self._zoom, 2), self._fit_width)
+        if cache_key in self._page_cache:
+            self.lbl_img.setPixmap(self._page_cache[cache_key])
             return
+
         import fitz
         doc = fitz.open(stream=self._pdf_bytes, filetype="pdf")
         page = doc[self._current_page]
-        mat = fitz.Matrix(2.0 * self._zoom, 2.0 * self._zoom)
+
+        if self._fit_width:
+            # Escalar para llenar el ancho disponible del scroll
+            vp_w = max(self.scroll.viewport().width() - 40, 400)
+            page_w = page.rect.width
+            scale = vp_w / page_w if page_w > 0 else 1.5
+        else:
+            scale = self._zoom * 2.0
+
+        mat = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=mat)
         doc.close()
-        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                     QImage.Format.Format_RGB888)
         pm = QPixmap.fromImage(img)
-        self._page_cache[self._current_page] = pm
+        self._page_cache[cache_key] = pm
         self.lbl_img.setPixmap(pm)
+
+        zoom_pct = int(scale / 2.0 * 100)
+        self.lbl_zoom.setText(f"{zoom_pct}%")
+
+    # ── Controles de página ──────────────────────────────────
 
     def _prev_page(self):
         if self._current_page > 0:
@@ -410,15 +560,45 @@ class PDFViewer(QWidget):
             self._current_page += 1
             self._render()
 
+    def _on_page_entered(self):
+        try:
+            n = int(self.le_page.text()) - 1
+            if 0 <= n < self._total_pages:
+                self._current_page = n
+                self._render()
+        except ValueError:
+            self.le_page.setText(str(self._current_page + 1))
+
+    # ── Controles de zoom ─────────────────────────────────────
+
     def _zoom_in(self):
-        self._zoom = min(self._zoom + 0.25, 3.0)
+        self._fit_width = False
+        self._zoom = min(self._zoom + 0.25, 4.0)
         self._page_cache.clear()
         self._render()
 
     def _zoom_out(self):
-        self._zoom = max(self._zoom - 0.25, 0.5)
+        self._fit_width = False
+        self._zoom = max(self._zoom - 0.25, 0.25)
         self._page_cache.clear()
         self._render()
+
+    def _reset_zoom(self):
+        self._fit_width = False
+        self._zoom = 1.0
+        self._page_cache.clear()
+        self._render()
+
+    def _toggle_fit(self):
+        self._fit_width = not self._fit_width
+        self.btn_fit.setStyleSheet(
+            self.BTN_STYLE.replace(f"background: {C_PANEL}", f"background: {C_ACCENT}")
+            if self._fit_width else self.BTN_STYLE
+        )
+        self._page_cache.clear()
+        self._render()
+
+
 
 
 # ─────────────────────────────────────────────────────────────
