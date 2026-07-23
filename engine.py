@@ -1,11 +1,39 @@
 """
 engine.py — Motor de extracción y validación normativa
 Revisor de Informes Semestrales EFIARTES
+v2.0 — Mejoras: OCR, truncado inteligente, fallbacks robustos
 """
 
 import re
+import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+# Debug flag: set environment variable EFIARTES_DEBUG=1 to enable
+DEBUG = os.getenv('EFIARTES_DEBUG') == '1'
+
+# Configure Tesseract path for Windows & PyInstaller
+import sys
+if hasattr(sys, '_MEIPASS'):
+    # Running as PyInstaller executable
+    base_dir = sys._MEIPASS
+else:
+    # Running from source
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+TESSERACT_PATH = os.path.join(base_dir, 'bin', 'tesseract', 'tesseract.exe')
+
+# Fallback to system installation if local bin doesn't exist
+if not os.path.exists(TESSERACT_PATH):
+    TESSERACT_PATH = os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
+
+if os.path.exists(TESSERACT_PATH):
+    tesseract_dir = os.path.dirname(TESSERACT_PATH)
+    if tesseract_dir not in os.environ.get('PATH', ''):
+        os.environ['PATH'] = os.environ.get('PATH', '') + os.pathsep + tesseract_dir
+    tessdata = os.path.join(tesseract_dir, 'tessdata')
+    if os.path.isdir(tessdata):
+        os.environ['TESSDATA_PREFIX'] = tessdata
 
 try:
     import fitz  # PyMuPDF
@@ -42,20 +70,148 @@ NUMEROS_INFORME = {
     "décimo": 10, "decimo": 10,
 }
 
+# Labels that signal the start of a new field — used to truncate captured values
+NEXT_LABEL_PATTERNS = [
+    r'\bnombre\s+de\s+la\s+(?:erpi|empresa)\b',
+    r'\bempresa\s+(?:responsable|productora)\b',
+    r'\betapa\s+(?:de\s+desarrollo|del\s+proyecto)\b',
+    r'\berpi\b',
+    r'\betapa\b',
+    r'\bperiodo\s+del\s+informe\b',
+    r'\bn[uú]mero\s+del\s+informe\b',
+    r'\brecinto\b',
+    r'\bfecha\s+de(?:l|\s+inicio)\b',
+    r'\bejercicio\s+de\s+los\s+recursos\b',
+    r'\bactividades\s+detalladas\b',
+    r'\bpor\s+(?:este|medio)\b',
+    r'\ba\s+quien\s+corresponda\b',
+    r'\bRESUMEN\b',
+    r'\bSIGN\b',
+    r'\bB\.\s*N[uú]mero\b',
+    r'\bC\.\s*Actividades\b',
+]
+
+# Minimum chars per page to consider a page has extractable text
+MIN_CHARS_PER_PAGE = 40
+
 
 # ─────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE TEXTO
+# TEXT PREPROCESSING
 # ─────────────────────────────────────────────────────────────
+
+def preprocess_text(text: str) -> str:
+    """Normalize PDF extracted text.
+    - Replace line‑breaks that split words (e.g., hyphenated words) with nothing.
+    - Collapse remaining newlines into spaces so that multi‑line titles are treated as one line.
+    """
+    # Join lines broken by hyphenation or simple split without losing spaces
+    text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
+    # Replace remaining newlines with a single space
+    text = re.sub(r"\n+", " ", text)
+    return text
+
+
+def _truncate_at_next_label(value: str) -> str:
+    """Truncate a captured field value when a known next-field label appears."""
+    if not value:
+        return value
+    best_pos = len(value)
+    for pat in NEXT_LABEL_PATTERNS:
+        m = re.search(pat, value, re.IGNORECASE)
+        if m and m.start() > 0:
+            best_pos = min(best_pos, m.start())
+    result = value[:best_pos].strip()
+    # Remove trailing punctuation
+    result = re.sub(r'[\s:—\-–.,;]+$', '', result).strip()
+    return result if result else value
+
+
+# ─────────────────────────────────────────────────────────────
+# TEXT EXTRACTION + OCR
+# ─────────────────────────────────────────────────────────────
+
+def _try_ocr_page(page, lang: str = "spa") -> str:
+    """Attempt OCR using PyTesseract with Max RGB filtering first (removes highlighters), then fallback to PyMuPDF."""
+    text = _try_pytesseract_page(page, lang)
+    if text and len(text.strip()) > 10:
+        return text
+    
+    # Fallback to PyMuPDF built-in OCR
+    try:
+        tp = page.get_textpage_ocr(language=lang, dpi=300, full=True)
+        text = page.get_text(textpage=tp)
+        if DEBUG:
+            print(f"  DEBUG PyMuPDF OCR page: got {len(text)} chars")
+        return text
+    except Exception as e:
+        if DEBUG:
+            print(f"  DEBUG PyMuPDF OCR failed for page: {e}")
+        return ""
+
+
+def _try_pytesseract_page(page, lang: str = "spa") -> str:
+    """Fallback OCR using pytesseract + PIL with Max RGB filtering."""
+    try:
+        import pytesseract
+        import numpy as np
+        from PIL import Image
+        
+        # Add tesseract to PATH to avoid WinError 2
+        tesseract_dir = os.path.dirname(TESSERACT_PATH)
+        if tesseract_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] += os.pathsep + tesseract_dir
+            
+        if os.path.exists(TESSERACT_PATH):
+            pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+            
+        pix = page.get_pixmap(dpi=300)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Apply Max RGB filter: removes bright colored highlighters (orange, yellow, green)
+        # while keeping black text intact
+        arr = np.array(img)
+        max_arr = np.max(arr, axis=2)
+        img_max = Image.fromarray(max_arr)
+        
+        text = pytesseract.image_to_string(img_max, lang=lang)
+        if DEBUG:
+            print(f"  DEBUG pytesseract (Max RGB) page: got {len(text)} chars")
+        return text
+    except Exception as e:
+        if DEBUG:
+            print(f"  DEBUG pytesseract failed: {e}")
+        return ""
+
 
 def extract_text(pdf_path: str) -> str:
-    """Extrae texto completo de un PDF usando PyMuPDF."""
+    """Extrae texto completo de un PDF usando PyMuPDF, con fallback a OCR para páginas escaneadas."""
     if fitz is None:
         raise ImportError("PyMuPDF (fitz) no está instalado.")
     try:
         doc = fitz.open(pdf_path)
-        pages = [page.get_text() for page in doc]
+        pages_text = []
+        ocr_used = False
+
+        for page_num, page in enumerate(doc):
+            text = page.get_text()
+
+            # If the page has very little text, try OCR
+            if len(text.strip()) < MIN_CHARS_PER_PAGE:
+                if DEBUG:
+                    print(f"  DEBUG: Page {page_num+1} has only {len(text.strip())} chars, attempting OCR...")
+                ocr_text = _try_ocr_page(page)
+                if len(ocr_text.strip()) > len(text.strip()):
+                    text = ocr_text
+                    ocr_used = True
+
+            pages_text.append(text)
+
         doc.close()
-        return "\n".join(pages)
+
+        full_text = "\n".join(pages_text)
+        if ocr_used and DEBUG:
+            print(f"  DEBUG: OCR was used for this document. Total text: {len(full_text)} chars")
+        return full_text
     except Exception as e:
         return f"[ERROR al leer PDF: {e}]"
 
@@ -135,62 +291,184 @@ def extract_fields(text: str) -> dict:
         "texto_completo":     text,
     }
 
-    # --- Nombre del proyecto ---
-    fields["nombre_proyecto"] = _find_after_label(text, [
-        r"nombre\s+del\s+proyecto\s*:?",
-        r"t[\u00ed]tulo\s+del\s+proyecto\s*:?",
-        r"proyecto\s+de\s+inversi[o\u00f3]n\s+denominado\s+",
-        r"proyecto\s+denominado\s+",
-        r"proyecto\s*:\s*",
-    ])
-    # Si no encontrado con etiqueta, busca en mayúsculas entre comillas
-    if not fields["nombre_proyecto"]:
-        m = re.search(r'[\u00ab\u201c\u201d"]([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d1][^\u00bb\u201c\u201d"]{3,120})[\u00bb\u201c\u201d"]', text)
-        if m:
-            fields["nombre_proyecto"] = m.group(1).replace('\n', ' ').replace('\r', ' ').strip()
-    if not fields["nombre_proyecto"]:
-        m = re.search(r'proyecto[^\n]{0,80}?[\u00ab\u201c\u201d"]([^"\u00bb\u201d]+)[\u00bb\u201c\u201d"]', text, re.IGNORECASE)
-        if m:
-            fields["nombre_proyecto"] = m.group(1).replace('\n', ' ').replace('\r', ' ').strip()
-    if not fields["nombre_proyecto"]:
-        m = re.search(r'del proyecto\s+([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d10-9\s]{5,80})\.', text)
-        if m:
-            fields["nombre_proyecto"] = m.group(1).strip()
+    # Preprocess text to handle line breaks before extraction
+    proc_text = preprocess_text(text)
 
-    # --- Nombre de la ERPI ---
-    erpi_raw = _find_after_label(text, [
-        r"empresa\s+responsable\s+del\s+proyecto\s+de\s+inversi[\u00f3o]n\s*:",
+    # ── Nombre del proyecto ──────────────────────────────────
+    fields["nombre_proyecto"] = _find_after_label(proc_text, [
+        r"nombre\s+del\s+proyecto\s*:?\s*",
+        r"t[ií]tulo\s+del\s+proyecto\s*:?\s*",
+        r"proyecto\s+de\s+inversi[óo]n\s+denominado\s+",
+        r"proyecto\s+denominado\s+",
+    ])
+    if fields["nombre_proyecto"]:
+        fields["nombre_proyecto"] = _truncate_at_next_label(fields["nombre_proyecto"])
+
+    if DEBUG:
+        print('DEBUG: nombre_proyecto after primary extraction:', fields["nombre_proyecto"])
+
+    # Fallback: text in guillemets «...» or curly quotes "..."
+    if not fields["nombre_proyecto"]:
+        m = re.search(
+            r'[\u00ab\u201c\u201d"]'
+            r'([A-ZÁÉÍÓÚÑ][^\u00bb\u201c\u201d"]{3,200})'
+            r'[\u00bb\u201c\u201d"]',
+            proc_text
+        )
+        if m:
+            candidate = m.group(1).replace('\n', ' ').replace('\r', ' ').strip()
+            # Skip if it looks like a date/month, a short fragment, or ERPI info
+            if (not re.search(r"erpi|empresa", candidate, re.IGNORECASE)
+                    and len(candidate) > 8
+                    and not re.match(r'^(?:ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+\d{4}$', candidate, re.IGNORECASE)):
+                fields["nombre_proyecto"] = _truncate_at_next_label(candidate)
+
+    # Fallback: "del proyecto TITLE" with caps
+    if not fields["nombre_proyecto"]:
+        m = re.search(
+            r"del\s+proyecto\s+([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s,]{5,120})[.\n]",
+            proc_text
+        )
+        if m:
+            candidate = m.group(1).strip()
+            if not re.search(r"erpi|empresa", candidate, re.IGNORECASE):
+                fields["nombre_proyecto"] = _truncate_at_next_label(candidate)
+
+    # Fallback for Libro-style: ALL-CAPS title after "INFORME SEMESTRAL N - MONTH YYYY"
+    if not fields["nombre_proyecto"]:
+        m = re.search(
+            r"INFORME\s+SEMESTRAL\s*\d*\s*[-–]?\s*"
+            r"(?:ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)"
+            r"\s*\d{2,4}\s+"
+            r"([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9\s]{5,120}?)(?:\s{2,}|\s+Por\s+medio)",
+            proc_text
+        )
+        if m:
+            candidate = m.group(1).strip()
+            upper_ratio = sum(1 for c in candidate if c.isupper()) / max(len(candidate.replace(' ', '')), 1)
+            if upper_ratio > 0.6 and len(candidate) > 10:
+                fields["nombre_proyecto"] = candidate
+
+    # Fallback: "del proyecto TITLE." repeated in body text
+    if not fields["nombre_proyecto"]:
+        m = re.search(
+            r"del\s+proyecto\s+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9\s,]{5,120}?)\.",
+            proc_text
+        )
+        if m:
+            candidate = m.group(1).strip()
+            upper_ratio = sum(1 for c in candidate if c.isupper()) / max(len(candidate.replace(' ', '')), 1)
+            if upper_ratio > 0.5 and len(candidate) > 10:
+                fields["nombre_proyecto"] = _truncate_at_next_label(candidate)
+
+    # Fallback: "proyecto TITLE." with capitalized word
+    if not fields["nombre_proyecto"]:
+        m = re.search(
+            r"proyecto\s+([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s]{5,120})[.,]",
+            proc_text
+        )
+        if m:
+            candidate = m.group(1).strip()
+            if not re.search(r"erpi|empresa", candidate, re.IGNORECASE):
+                fields["nombre_proyecto"] = _truncate_at_next_label(candidate)
+
+    # Quality filter: reject low-quality OCR captures
+    if fields["nombre_proyecto"]:
+        pn = fields["nombre_proyecto"]
+        # Count special characters (non-alphanumeric, non-space, non-accented)
+        special_chars = sum(1 for c in pn if not c.isalnum() and c not in ' áéíóúñÁÉÍÓÚÑ.,:-')
+        alpha_chars = sum(1 for c in pn if c.isalpha())
+        # Reject if too short, too many special chars, or no alphabetic content
+        if len(pn) < 5 or alpha_chars < 3 or (special_chars > len(pn) * 0.3):
+            if DEBUG:
+                print(f'DEBUG: Rejecting low-quality nombre_proyecto: "{pn}"')
+            fields["nombre_proyecto"] = None
+
+    # ── Nombre de la ERPI ────────────────────────────────────
+    erpi_raw = _find_after_label(proc_text, [
+        r"empresa\s+responsable\s+del\s+proyecto\s+de\s+inversi[óo]n\s*:",
         r"empresa\s+responsable\s*:",
-        r"nombre\s+de\s+la\s+erpi\s*:?",
-        r"empresa\s+productora\s*:?",
+        r"nombre\s+de\s+la\s+erpi\s*:?\s*",
+        r"empresa\s+productora\s*:\s*",
         r"(?<![a-z])erpi\s*:\s*",
     ])
     if erpi_raw:
-        # Cortar antes de palabras que indican el inicio de otro campo
-        erpi_raw = re.split(r'(?i)\betapa\b|\bnombre\b|\bdel\b|\bproyecto\b', erpi_raw)[0].strip()
-        # Limpiar caracteres sobrantes al final
+        erpi_raw = _truncate_at_next_label(erpi_raw)
         erpi_raw = re.sub(r'[\.,;:\-—]+$', '', erpi_raw).strip()
         if erpi_raw:
             fields["nombre_erpi"] = erpi_raw
+
+    # Fallback: "suscrito C. <NOMBRE> representante legal"
     if not fields["nombre_erpi"]:
-        m = re.search(r'suscrit[oa]\s+C\.\s+([A-Z\u00c1\u00c9\u00cd\u00d3\u00da\u00d1\s]{3,80}?)\s+representante\s+legal', text, re.IGNORECASE)
+        m = re.search(
+            r"suscr[ií]t[oa]\s+C\.\s+([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s]{3,80})\s+representante\s+legal",
+            proc_text, re.IGNORECASE
+        )
         if m:
             fields["nombre_erpi"] = m.group(1).strip()
 
-    # --- Etapa ---
-    etapa_val = _find_after_label(text, [
-        r"etapa\s+de\s+desarrollo\s+del\s+proyecto\s+de\s+inversi[\u00f3o]n\s*:?",
-        r"etapa\s+de\s+desarrollo\s+del\s+proyecto\s*:?",
-        r"etapa\s+del\s+proyecto\s+de\s+inversi[\u00f3o]n\s*:?",
-        r"etapa\s+del\s+proyecto\s*:?",
-        r"etapa\s+de\s+desarrollo\s*:?",
-        r"etapa\s*:?\s*"
+    # Fallback: "<NAME>\nRepresentante Legal" (Libro-style, no label)
+    if not fields["nombre_erpi"]:
+        # Search in raw text (with newlines) for name on line before "Representante Legal"
+        m = re.search(
+            r"(?:_{2,}\s*\n\s*)?([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s]{5,80}?)\s*\n\s*Representante\s+Legal",
+            text, re.IGNORECASE
+        )
+        if m:
+            candidate = m.group(1).strip()
+            # Ensure it looks like a name (2-5 words, not too long)
+            words = candidate.split()
+            if 2 <= len(words) <= 8:
+                fields["nombre_erpi"] = candidate
+
+    # Fallback: "nombre de la empresa productora: X" (alternate wording)
+    if not fields["nombre_erpi"]:
+        erpi_raw2 = _find_after_label(proc_text, [
+            r"nombre\s+de\s+la\s+empresa\s+productora\s*:\s*",
+            r"empresa\s+de\s+producci[óo]n\s*:\s*",
+        ])
+        if erpi_raw2:
+            fields["nombre_erpi"] = _truncate_at_next_label(erpi_raw2)
+
+    # Fallback: "*NAME AC" or "NAME, A.C." pattern in text (Teatro 3 style)
+    if not fields["nombre_erpi"]:
+        m = re.search(
+            r'\*([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s]{3,60})\s+(?:A\.?C\.?|S\.?A\.?|S\.?C\.?)',
+            proc_text
+        )
+        if m:
+            fields["nombre_erpi"] = m.group(1).strip() + " " + m.group(0).split()[-1]
+
+    # Fallback: "a nombre de NAME A.C." pattern
+    if not fields["nombre_erpi"]:
+        m = re.search(
+            r'a\s+nombre\s+de\s+([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s.,]{3,80}(?:A\.?C\.?|S\.?A\.?|S\.?C\.?))',
+            proc_text, re.IGNORECASE
+        )
+        if m:
+            fields["nombre_erpi"] = m.group(1).strip()
+
+    # ── Etapa ────────────────────────────────────────────────
+    etapa_val = _find_after_label(proc_text, [
+        r"etapa\s+de\s+desarrollo\s+del\s+proyecto\s+de\s+inversi[óo]n\s*:\s*",
+        r"etapa\s+de\s+desarrollo\s+del\s+proyecto\s*:\s*",
+        r"etapa\s+del\s+proyecto\s+de\s+inversi[óo]n\s*:\s*",
+        r"etapa\s+del\s+proyecto\s*:\s*",
+        r"etapa\s+de\s+desarrollo\s*:\s*",
     ])
     if etapa_val:
-        # Tomar solo la primera línea
-        etapa_val = re.split(r'[\n\r]', etapa_val)[0].strip()
+        etapa_val = _truncate_at_next_label(etapa_val)
         fields["etapa"] = etapa_val[:120]
     else:
+        # Fallback: table-style "ETAPA DEL PROYECTO <value>"
+        etapa_val2 = _find_after_label(proc_text, [
+            r"etapa\s+del\s*\n?\s*proyecto\s*:?\s*",
+        ])
+        if etapa_val2:
+            etapa_val2 = _truncate_at_next_label(etapa_val2)
+            fields["etapa"] = etapa_val2[:120]
+
+    if not fields.get("etapa"):
         # Buscar etapa directamente en texto
         text_lower = text.lower()
         for etapa in ETAPAS:
@@ -198,7 +476,7 @@ def extract_fields(text: str) -> dict:
                 fields["etapa"] = etapa.capitalize()
                 break
 
-    # --- Número del informe ---
+    # ── Número del informe ───────────────────────────────────
     # Busca "N informe semestral" o "Nto. informe semestral"
     m = re.search(
         r'(primer|primero|segundo|tercero|tercer|cuarto|quinto|sexto|s[eé]ptimo|octavo|noveno|d[eé]cimo)'
@@ -216,63 +494,116 @@ def extract_fields(text: str) -> dict:
             fields["numero_informe"] = m2.group(0).strip()
             fields["numero_informe_int"] = int(m2.group(1))
 
-    # --- Período ---
+    # Fallback: "INFORME SEMESTRAL N" in header style
+    if not fields["numero_informe"]:
+        m3 = re.search(r'INFORME\s+SEMESTRAL\s+(\d+)', text)
+        if m3:
+            fields["numero_informe"] = m3.group(0).strip()
+            fields["numero_informe_int"] = int(m3.group(1))
+
+    # Also search preprocessed text for ordinal + informe
+    if not fields["numero_informe"]:
+        m4 = re.search(
+            r'(primer|primero|segundo|tercero|tercer|cuarto|quinto|sexto|s[eé]ptimo|octavo|noveno|d[eé]cimo)'
+            r'[o]?\s+informe\s+semestral',
+            proc_text, re.IGNORECASE
+        )
+        if m4:
+            num_word = m4.group(1).lower()
+            fields["numero_informe"] = m4.group(0).strip()
+            fields["numero_informe_int"] = NUMEROS_INFORME.get(num_word, None)
+
+    # ── Período ──────────────────────────────────────────────
     m = re.search(
-        r'(enero|julio)\s*(?:-|–|de|del|,)?\s*(20\d{2})',
+        r'(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)'
+        r'\s*(?:-|–|de|del|,|a)?\s*(20\d{2})',
         text, re.IGNORECASE
     )
     if m:
         fields["periodo"] = f"{m.group(1).capitalize()} {m.group(2)}"
     else:
         # Buscar período en formato "Jun-26" o "Ene 2025"
-        m2 = re.search(r'(ene|jan|jun|jul)[a-z]*[\s\-–,]+(20\d{2}|\d{2})', text, re.IGNORECASE)
+        m2 = re.search(r'(ene|jan|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)[a-z]*[\s\-–,]+(20\d{2}|\d{2})', text, re.IGNORECASE)
         if m2:
             fields["periodo"] = m2.group(0).strip()
 
-    # --- Fecha de inicio de recursos ---
-    # Busca fechas explícitas: "el DD de MES de YYYY" o "DD/MM/YYYY"
+    # Fallback: "FECHA DEL INFORME DD/MM/YYYY" (table format)
+    if not fields["periodo"]:
+        m3 = re.search(r'FECHA\s+DEL\s*\n?\s*INFORME\s*:?\s*(\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4})', proc_text, re.IGNORECASE)
+        if m3:
+            fields["periodo"] = m3.group(1).strip()
+
+    # ── Fecha de inicio de recursos ──────────────────────────
     DATE_PAT = r'(\d{1,2}\s+de\s+\w+\s+(?:de\s+)?20\d{2}|\d{1,2}[/\-]\d{1,2}[/\-]20\d{2})'
     fecha_inicio = None
-    for pat in [
-        r"fecha de inicio de (?:aplicaci[o\u00f3]n|los recursos)[^\n]{0,40}" + DATE_PAT,
-        r"inicio de (?:la\s+)?aplicaci[o\u00f3]n[^\n]{0,40}" + DATE_PAT,
-        r"se inici[o\u00f3][^\n]{0,60}" + DATE_PAT,
-        r"inicio de aplicaci[o\u00f3]n de recursos[^\n]{0,30}:\s*" + DATE_PAT,
-        r"fecha de inicio[^\n]{0,40}" + DATE_PAT,
-    ]:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            fecha_inicio = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
+
+    # Search in both raw and preprocessed text
+    for search_text in [text, proc_text]:
+        if fecha_inicio:
             break
-    # También busca el patrón con etiqueta simple
+        for pat in [
+            r"fecha\s+de\s+inicio\s+de\s+(?:aplicaci[oó]n|los\s+recursos).{0,60}" + DATE_PAT,
+            r"inicio\s+de\s+(?:la\s+)?aplicaci[oó]n.{0,60}" + DATE_PAT,
+            r"se\s+inici[oó]\s+la\s+aplicaci[oó]n.{0,80}" + DATE_PAT,
+            r"inicio\s+de\s+aplicaci[oó]n\s+de\s+recursos.{0,40}:\s*" + DATE_PAT,
+            r"fecha\s+de\s+inicio.{0,60}" + DATE_PAT,
+            r"se\s+inici[oó].{0,80}" + DATE_PAT,
+        ]:
+            m = re.search(pat, search_text, re.IGNORECASE)
+            if m:
+                fecha_inicio = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
+                break
+
+    # Also try label-based search on preprocessed text
     if not fecha_inicio:
-        raw = _find_after_label(text, [
-            r"fecha de inicio de (?:aplicaci[o\u00f3]n de )?recursos\s*:?",
-            r"inicio de aplicaci[o\u00f3]n de recursos\s*:?",
+        raw = _find_after_label(proc_text, [
+            r"fecha\s+de\s+inicio\s+de\s+(?:aplicaci[oó]n\s+de\s+)?recursos\s*:?\s*",
+            r"inicio\s+de\s+aplicaci[oó]n\s+de\s+recursos\s*:?\s*",
+            r"fecha\s+de\s+inicio\s+de\s+aplicaci[oó]n\s*:?\s*",
         ])
         if raw:
-            # Verificar que hay una fecha real en el texto capturado
             dm = re.search(DATE_PAT, raw, re.IGNORECASE)
             if dm:
                 fecha_inicio = dm.group(0)
+
+    # Fallback: "El día DD de MES de YYYY se inició" pattern
+    if not fecha_inicio:
+        m = re.search(
+            r'(?:el\s+)?(?:día\s+)?' + DATE_PAT + r'.{0,40}(?:se\s+inici[oó]|fue\s+realizada)',
+            proc_text, re.IGNORECASE
+        )
+        if m:
+            fecha_inicio = m.group(1)
+
     fields["fecha_inicio_recursos"] = fecha_inicio
 
-    # --- Menciona documentos adjuntos ---
+    # ── Menciona documentos adjuntos ─────────────────────────
     adj_patterns = [
-        r'se adjunt[ao]', r'se acompa[ñn]', r'documentos complementarios',
-        r'estados de cuenta', r'comprobante', r'cartel adjunto',
-        r'se incluye', r'se anexa', r'ver anexo',
+        r'se\s+adjunt[ao]', r'se\s+acompa[ñn]', r'documentos\s+complementarios',
+        r'estados?\s+de\s+cuenta', r'comprobante', r'cartel\s+adjunto',
+        r'se\s+incluye', r'se\s+anexa[n]?', r'ver\s+anexo',
+        r'se\s+subie(?:ron|ó)', r'hiperv[ií]nculo', r'carpeta\s+comprobable',
+        r'evidencia\s+fotogr[áa]fica', r'se\s+anexa(?:n)?\s+im[áa]genes',
+        r'adjunto\s+encontrar', r'v[ée]ase\s+anexo',
+        r'se\s+adjunta\s+como\s+anexo', r'anexo\s+\d',
+        r'carpeta\s+de\s+(?:evidencia|comprobantes|respaldo)',
+        r'drive\.google\.com', r'dropbox\.com',
     ]
     fields["menciona_adjuntos"] = any(
         re.search(p, text, re.IGNORECASE) for p in adj_patterns
     )
+    # Also check preprocessed text
+    if not fields["menciona_adjuntos"]:
+        fields["menciona_adjuntos"] = any(
+            re.search(p, proc_text, re.IGNORECASE) for p in adj_patterns
+        )
 
-    # --- Texto de actividades ---
-    # Extraer párrafos que contienen palabras clave de actividades
+    # ── Texto de actividades ─────────────────────────────────
     act_keywords = [
         "ensayo", "actividad", "presenta", "función", "funciones",
         "realizad", "producci", "grabaci", "difusi", "administrati",
         "cronograma", "pago", "honorario", "contrato", "creativ",
+        "remontaje", "temporada", "gira", "estreno",
     ]
     lines = text.split('\n')
     act_lines = []
@@ -415,7 +746,6 @@ def process_report(pdf_path: str) -> dict:
     """
     Procesa un PDF completo y retorna un dict con toda la información.
     """
-    import os
     text = extract_text(pdf_path)
     pages = get_page_count(pdf_path)
     fields = extract_fields(text)

@@ -643,8 +643,10 @@ class ReviewPanel(QWidget):
     """Panel con campos extraídos, checklist y observaciones."""
     changed = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, chk_firma, chk_id_oficial, parent=None):
         super().__init__(parent)
+        self.chk_firma = chk_firma
+        self.chk_id_oficial = chk_id_oficial
         self._report: Optional[dict] = None
         self._build()
 
@@ -695,15 +697,6 @@ class ReviewPanel(QWidget):
         self._check_rows: list[QWidget] = []
         self._check_layout = v_check
         v.addWidget(grp_check)
-
-        # ── Validación manual ────────────────────────────────
-        grp_manual = QGroupBox("Validación manual")
-        v_man = QVBoxLayout(grp_manual)
-        self.chk_firma     = QCheckBox("Firma del representante legal presente")
-        self.chk_id_oficial= QCheckBox("Identificación oficial adjunta")
-        v_man.addWidget(self.chk_firma)
-        v_man.addWidget(self.chk_id_oficial)
-        v.addWidget(grp_manual)
 
         # ── Observaciones ────────────────────────────────────
         grp_obs = QGroupBox("Observaciones del revisor")
@@ -966,12 +959,31 @@ class MainWindow(QMainWindow):
         left = self._build_left()
         splitter.addWidget(left)
 
-        # Centro — Visor PDF
+        # Centro — Visor PDF + Validación manual
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        
         self.pdf_viewer = PDFViewer()
-        splitter.addWidget(self.pdf_viewer)
+        center_layout.addWidget(self.pdf_viewer)
+
+        grp_manual = QGroupBox("Validación manual (Fijas)")
+        grp_manual.setStyleSheet(f"QGroupBox {{ margin-top: 2ex; border: 1px solid {C_BORDER}; border-radius: 4px; }}"
+                                 f"QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 3px; color: {C_TEXT}; }}")
+        h_man = QHBoxLayout(grp_manual)
+        self.chk_firma = QCheckBox("Firma del representante legal presente")
+        self.chk_id_oficial = QCheckBox("Identificación oficial adjunta")
+        h_man.addWidget(self.chk_firma)
+        h_man.addWidget(self.chk_id_oficial)
+        h_man.addStretch()
+        
+        center_layout.addWidget(grp_manual)
+        
+        splitter.addWidget(center)
 
         # Derecha — Panel de revisión
-        self.review_panel = ReviewPanel()
+        self.review_panel = ReviewPanel(self.chk_firma, self.chk_id_oficial)
         self.review_panel.setMinimumWidth(380)
         self.review_panel.changed.connect(self._on_review_changed)
         splitter.addWidget(self.review_panel)
