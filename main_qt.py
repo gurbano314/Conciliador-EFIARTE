@@ -1164,8 +1164,16 @@ class MainWindow(QMainWindow):
         self._current_idx = row
         report = self._reports[row]
         self.review_panel.load_report(report)
-        self.pdf_viewer.load_path(report["path"])
-        self.status.showMessage(f"Revisando: {report['filename']}", 0)
+        
+        pdf_path = report.get("path", "")
+        if not os.path.exists(pdf_path) and hasattr(self, '_session_file') and self._session_file:
+            session_dir = os.path.dirname(self._session_file)
+            alt_path = os.path.join(session_dir, os.path.basename(pdf_path))
+            if os.path.exists(alt_path):
+                pdf_path = alt_path
+                
+        self.pdf_viewer.load_path(pdf_path)
+        self.status.showMessage(f"Revisando: {report.get('filename', '')}", 0)
 
     def _on_review_changed(self):
         """Sincroniza el panel al informe y actualiza el item de la lista."""
@@ -1313,6 +1321,11 @@ class MainWindow(QMainWindow):
             self._unsaved = False
             self._update_kpis()
             self.status.showMessage(f"Sesión cargada: {path} — {len(self._reports)} informes.", 4000)
+            
+            # Auto-seleccionar el primer elemento para mostrar sus datos
+            if self.list_reports.count() > 0:
+                self.list_reports.setCurrentRow(0)
+                
             QMessageBox.information(self, "Sesión abierta", f"Se ha abierto la sesión exitosamente desde:\n{path}\n\nSe cargaron {len(self._reports)} informes.")
         except Exception as e:
             QMessageBox.critical(self, "Error al abrir", f"No se pudo abrir la sesión:\n{e}")
