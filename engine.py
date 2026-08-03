@@ -183,8 +183,12 @@ def _try_pytesseract_page(page, lang: str = "spa") -> str:
         return ""
 
 
-def extract_text(pdf_path: str) -> str:
-    """Extrae texto completo de un PDF usando PyMuPDF, con fallback a OCR para páginas escaneadas."""
+def extract_text(pdf_path: str) -> tuple[str, list[str]]:
+    """Extrae texto completo de un PDF usando PyMuPDF, con fallback a OCR.
+
+    Returns:
+        (full_text, pages_text) – texto completo y lista de textos por página.
+    """
     if fitz is None:
         raise ImportError("PyMuPDF (fitz) no está instalado.")
     try:
@@ -211,9 +215,9 @@ def extract_text(pdf_path: str) -> str:
         full_text = "\n".join(pages_text)
         if ocr_used and DEBUG:
             print(f"  DEBUG: OCR was used for this document. Total text: {len(full_text)} chars")
-        return full_text
+        return full_text, pages_text
     except Exception as e:
-        return f"[ERROR al leer PDF: {e}]"
+        return f"[ERROR al leer PDF: {e}]", []
 
 
 def get_page_count(pdf_path: str) -> int:
@@ -248,6 +252,68 @@ def detect_discipline(text: str) -> str:
     return best if scores[best] > 0 else "No identificada"
 
 
+def _generate_ai_summary(text_to_summarize: str) -> str:
+    """Genera un resumen extractivo usando LexRank filtrando texto irrelevante."""
+    try:
+        import re
+        import sumy
+        from sumy.parsers.plaintext import PlaintextParser
+        from sumy.nlp.tokenizers import Tokenizer
+        from sumy.summarizers.lex_rank import LexRankSummarizer
+        
+        # Limpiar texto y remover boilerplate / tablas
+        clean_text = re.sub(r'\s+', ' ', text_to_summarize)
+        sentences = re.split(r'(?<=[.!?])\s+', clean_text)
+        
+        boilerplate_patterns = [
+            r"por medio del presente", r"a quien corresponda", r"sirva la presente", 
+            r"en cumplimiento", r"comité interinstitucional", r"estímulo fiscal",
+            r"adjunto encontrará", r"sin más por el momento", r"atentamente", 
+            r"suscrito", r"representante legal", r"se anexa", r"se adjunta", 
+            r"me refiero al presente", r"hacemos de su conocimiento", r"efiartes",
+            r"efiteatro", r"efidanza", r"efimusica", r"efilibro", r"efivisuales",
+            r"con el debido respeto", r"comparezco", r"presente reporte",
+            r"estado de cuenta", r"saldo de liquidación", r"saldo promedio", 
+            r"bbva", r"banorte", r"santander", r"clabe", r"sucursal",
+            r"impuesto sobre la renta", r"retener será de", r"comisiones",
+            r"tasa bruta", r"rendimiento", r"saldo promedio gravable",
+            r"inversión a plazo"
+        ]
+        
+        valid_sentences = []
+        for s in sentences:
+            s_clean = s.strip()
+            if not s_clean: continue
+            if any(re.search(pat, s_clean, re.IGNORECASE) for pat in boilerplate_patterns): continue
+            digits_and_symbols = len(re.findall(r'[\d\$\%\.,\-\/\(\)]', s_clean))
+            if len(s_clean) > 0 and (digits_and_symbols / len(s_clean)) > 0.15: continue
+            valid_sentences.append(s_clean)
+            
+        filtered_text = " ".join(valid_sentences)
+        if len(filtered_text) < 50:
+            filtered_text = clean_text # Fallback si filtramos demasiado
+        
+        parser = PlaintextParser.from_string(filtered_text, Tokenizer("spanish"))
+        summarizer = LexRankSummarizer()
+        
+        # Resumir a unas 4 oraciones
+        summary = summarizer(parser.document, 4)
+        resumen_ia = " ".join(str(s) for s in summary)
+            
+        # Redacción básica de datos personales (PII)
+        resumen_ia = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[CORREO]', resumen_ia)
+        resumen_ia = re.sub(r'\b\d{10}\b', '[TELÉFONO]', resumen_ia)
+        resumen_ia = re.sub(r'\b[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}\b', '[RFC]', resumen_ia)
+        
+        if resumen_ia and len(resumen_ia) > 30:
+            return resumen_ia
+    except Exception as e:
+        print(f"Error generando resumen sumy: {e}")
+        
+    return text_to_summarize[:2000]
+
+
+
 # ─────────────────────────────────────────────────────────────
 # EXTRACCIÓN DE CAMPOS
 # ─────────────────────────────────────────────────────────────
@@ -273,11 +339,81 @@ def _find_after_label(text: str, patterns: list[str], max_chars: int = 120) -> O
     return None
 
 
-def extract_fields(text: str) -> dict:
+def _find_field_page(pages_text: list[str], value: str) -> int:
+    """Busca en qué página aparece un valor extraído. Retorna -1 si no se encuentra."""
+    if not value or not pages_text:
+        return -1
+    # Normalizar para búsqueda
+    val_lower = value.lower().strip()
+    # Buscar fragmento significativo (primeras 40 chars)
+    search_fragment = val_lower[:40]
+    for page_num, page_text in enumerate(pages_text):
+        if search_fragment in page_text.lower():
+            return page_num
+        # Fallback: buscar sin saltos de línea
+        if search_fragment in page_text.lower().replace('\n', ' '):
+            return page_num
+    return -1
+
+
+def _extract_activity_section(text: str) -> str:
+    """Extrae la sección completa de actividades detalladas del informe.
+
+    Busca encabezados como 'C. Actividades detalladas' o 'Actividades realizadas'
+    y captura todo el texto hasta el siguiente encabezado de sección.
+    """
+    # Patrones de inicio de sección de actividades
+    section_starts = [
+        r'C\.?\s*Actividades\s+detalladas[^\n]*',
+        r'Actividades\s+detalladas[^\n]*',
+        r'Actividades\s+realizadas[^\n]*',
+        r'Descripci[oó]n\s+de\s+(?:las\s+)?actividades[^\n]*',
+        r'Desarrollo\s+de\s+(?:las\s+)?actividades[^\n]*',
+        r'Resumen\s+de\s+actividades[^\n]*',
+    ]
+
+    # Patrones de fin de sección (siguiente encabezado)
+    section_ends = [
+        r'(?:^|\n)\s*[D-Z]\.\s+[A-ZÁÉÍÓÚÑ]',   # "D. Siguiente sección"
+        r'(?:^|\n)\s*(?:IV|V|VI|VII)[\.\)]',     # Numeración romana
+        r'(?:^|\n)\s*\d+\.\s+[A-ZÁÉÍÓÚÑ]',      # "4. Siguiente"
+        r'(?:^|\n)\s*Firma\s+del\s+representante',
+        r'(?:^|\n)\s*SIGN',
+        r'(?:^|\n)\s*Atentamente',
+        r'(?:^|\n)\s*_{5,}',                      # Línea de firma
+        r'(?:^|\n)\s*Ejercicio\s+de\s+los\s+recursos',
+    ]
+
+    for start_pat in section_starts:
+        m_start = re.search(start_pat, text, re.IGNORECASE)
+        if m_start:
+            after = text[m_start.end():]
+            # Buscar dónde termina la sección
+            end_pos = len(after)
+            for end_pat in section_ends:
+                m_end = re.search(end_pat, after)
+                if m_end and m_end.start() < end_pos:
+                    end_pos = m_end.start()
+
+            section_text = after[:end_pos].strip()
+            # Limpiar y limitar
+            if len(section_text) > 50:
+                # Reemplazar saltos de línea sueltos por espacios para mejorar legibilidad
+                section_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', section_text)
+                return _generate_ai_summary(section_text)
+
+    # Si no encontró ni inicio ni fin claros, resumir el documento entero
+    return _generate_ai_summary(text)
+
+
+def extract_fields(text: str, pages_text: list[str] = None) -> dict:
     """
     Extrae los campos normativos del texto del informe.
-    Retorna un dict con los campos encontrados.
+    Retorna un dict con los campos encontrados y sus ubicaciones.
     """
+    if pages_text is None:
+        pages_text = []
+
     fields = {
         "nombre_proyecto":    None,
         "nombre_erpi":        None,
@@ -288,7 +424,9 @@ def extract_fields(text: str) -> dict:
         "fecha_inicio_recursos": None,
         "menciona_adjuntos":  False,
         "actividades_texto":  "",
+        "actividades_resumen": "",
         "texto_completo":     text,
+        "field_locations":    {},  # {field_name: {"search_text": ..., "page": ...}}
     }
 
     # Preprocess text to handle line breaks before extraction
@@ -613,6 +751,26 @@ def extract_fields(text: str) -> dict:
             act_lines.append(line.strip())
     fields["actividades_texto"] = "\n".join(act_lines[:20])  # Máximo 20 líneas
 
+    # ── Resumen de actividades (sección completa) ────────────
+    resumen = _extract_activity_section(text)
+    fields["actividades_resumen"] = resumen
+
+    # ── Construir field_locations ────────────────────────────
+    loc = {}
+    for field_name, field_value in [
+        ("nombre_proyecto", fields.get("nombre_proyecto")),
+        ("nombre_erpi", fields.get("nombre_erpi")),
+        ("etapa", fields.get("etapa")),
+        ("numero_informe", fields.get("numero_informe")),
+        ("periodo", fields.get("periodo")),
+        ("fecha_inicio_recursos", fields.get("fecha_inicio_recursos")),
+        ("actividades_resumen", fields.get("actividades_resumen")),
+    ]:
+        if field_value:
+            page = _find_field_page(pages_text, field_value)
+            loc[field_name] = {"search_text": field_value.strip(), "page": page}
+    fields["field_locations"] = loc
+
     return fields
 
 
@@ -746,9 +904,9 @@ def process_report(pdf_path: str) -> dict:
     """
     Procesa un PDF completo y retorna un dict con toda la información.
     """
-    text = extract_text(pdf_path)
+    text, pages_text = extract_text(pdf_path)
     pages = get_page_count(pdf_path)
-    fields = extract_fields(text)
+    fields = extract_fields(text, pages_text)
     discipline = detect_discipline(text)
     checklist = run_checklist(fields)
     status = global_status(checklist)

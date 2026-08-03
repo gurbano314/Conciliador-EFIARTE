@@ -370,6 +370,7 @@ class PDFViewer(QWidget):
         self._page_cache: dict = {}
         self._zoom = 1.0
         self._fit_width = False
+        self._highlight_rects: list = []  # List of fitz.Rect for current highlight
         self._build()
 
     def _build(self):
@@ -568,16 +569,78 @@ class PDFViewer(QWidget):
 
         mat = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=mat)
-        doc.close()
 
         img = QImage(pix.samples, pix.width, pix.height, pix.stride,
                      QImage.Format.Format_RGB888)
+                     
+        # Draw highlights if any
+        if self._highlight_rects:
+            painter = QPainter(img)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # Semi-transparent yellow
+            painter.setBrush(QColor(255, 255, 0, 100))
+            painter.setPen(Qt.PenStyle.NoPen)
+            for rect in self._highlight_rects:
+                # Transform rect to scaled image coordinates
+                r = rect * mat
+                painter.drawRect(int(r.x0), int(r.y0), int(r.width), int(r.height))
+            painter.end()
+
+        doc.close()
+
         pm = QPixmap.fromImage(img)
         self._page_cache[cache_key] = pm
         self.lbl_img.setPixmap(pm)
 
         zoom_pct = int(scale / 2.0 * 100)
         self.lbl_zoom.setText(f"{zoom_pct}%")
+
+        # Scroll to highlight if any
+        if self._highlight_rects:
+            first_rect = self._highlight_rects[0] * mat
+            # Delay the scroll slightly to ensure layout is updated
+            QTimer.singleShot(50, lambda: self._scroll_to_rect(first_rect))
+
+    def _scroll_to_rect(self, rect):
+        """Hace scroll hacia la zona resaltada."""
+        v_bar = self.scroll.verticalScrollBar()
+        # Center the rect in the viewport
+        target_y = int(rect.y0) - self.scroll.viewport().height() // 2
+        v_bar.setValue(max(0, target_y))
+
+    def highlight_text(self, search_text: str, page_num: int):
+        """Busca texto en la página indicada, lo resalta y navega hacia él."""
+        if not self._pdf_bytes or page_num < 0 or page_num >= self._total_pages or not search_text:
+            return
+
+        self._current_page = page_num
+        self._highlight_rects = []
+
+        import fitz
+        doc = fitz.open(stream=self._pdf_bytes, filetype="pdf")
+        page = doc[self._current_page]
+        
+        # Buscar coincidencias
+        search_query = search_text
+        if len(search_query) > 50:
+            search_query = search_query[:50].strip()
+            
+        rects = page.search_for(search_query)
+        if rects:
+            self._highlight_rects = rects
+        
+        doc.close()
+        
+        # Limpiar cache para forzar repintado con highlights
+        self._page_cache.clear()
+        self._render()
+
+    def clear_highlights(self):
+        """Limpia todos los resaltados activos."""
+        if self._highlight_rects:
+            self._highlight_rects = []
+            self._page_cache.clear()
+            self._render()
 
     # ── Controles de página ──────────────────────────────────
 
@@ -642,6 +705,7 @@ class NoScrollCombo(QComboBox):
 class ReviewPanel(QWidget):
     """Panel con campos extraídos, checklist y observaciones."""
     changed = pyqtSignal()
+    field_locate_requested = pyqtSignal(str)
 
     def __init__(self, chk_firma, chk_id_oficial, parent=None):
         super().__init__(parent)
@@ -680,13 +744,29 @@ class ReviewPanel(QWidget):
         self.le_revisor     = QLineEdit()
         self.le_revisor.setPlaceholderText("Tu nombre")
 
-        fl.addRow("Proyecto:",       self.le_proyecto)
-        fl.addRow("ERPI:",           self.le_erpi)
+        def _make_search_row(le_widget, field_name):
+            btn = QPushButton("🔍")
+            btn.setFixedSize(22, 22)
+            btn.setStyleSheet("padding:0; border:none; background:transparent;")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip("Ubicar en el documento original")
+            btn.clicked.connect(lambda _, f=field_name: self.field_locate_requested.emit(f))
+            
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0,0,0,0)
+            h.setSpacing(4)
+            h.addWidget(btn)
+            h.addWidget(le_widget)
+            return w
+
+        fl.addRow("Proyecto:",       _make_search_row(self.le_proyecto, "nombre_proyecto"))
+        fl.addRow("ERPI:",           _make_search_row(self.le_erpi, "nombre_erpi"))
         fl.addRow("Disciplina:",     self.cb_disciplina)
-        fl.addRow("Etapa:",          self.le_etapa)
-        fl.addRow("Nº Informe:",     self.le_num_informe)
-        fl.addRow("Período:",        self.le_periodo)
-        fl.addRow("Inicio recursos:",self.le_fecha_inicio)
+        fl.addRow("Etapa:",          _make_search_row(self.le_etapa, "etapa"))
+        fl.addRow("Nº Informe:",     _make_search_row(self.le_num_informe, "numero_informe"))
+        fl.addRow("Período:",        _make_search_row(self.le_periodo, "periodo"))
+        fl.addRow("Inicio recursos:",_make_search_row(self.le_fecha_inicio, "fecha_inicio_recursos"))
         fl.addRow("Revisor:",        self.le_revisor)
         v.addWidget(grp_datos)
 
@@ -697,6 +777,42 @@ class ReviewPanel(QWidget):
         self._check_rows: list[QWidget] = []
         self._check_layout = v_check
         v.addWidget(grp_check)
+
+        # ── Resumen de actividades ───────────────────────────
+        
+        # Envolver el título en un layout horizontal para agregar la lupa
+        w_act_title = QWidget()
+        h_act_title = QHBoxLayout(w_act_title)
+        h_act_title.setContentsMargins(0, 0, 0, 0)
+        h_act_title.setSpacing(6)
+        
+        btn_locate_act = QPushButton("🔍")
+        btn_locate_act.setFixedSize(22, 22)
+        btn_locate_act.setStyleSheet("padding:0; border:none; background:transparent;")
+        btn_locate_act.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_locate_act.setToolTip("Ubicar en el documento original")
+        btn_locate_act.clicked.connect(lambda: self.field_locate_requested.emit("actividades_resumen"))
+        
+        lbl_act_title = QLabel("Resumen de actividades")
+        lbl_act_title.setStyleSheet("font-weight: 600; color: #8F9EB8; margin-top: 5px;")
+        
+        h_act_title.addWidget(btn_locate_act)
+        h_act_title.addWidget(lbl_act_title)
+        h_act_title.addStretch()
+        
+        # Creamos el groupbox pero le quitamos el título por defecto, usaremos nuestro widget
+        grp_act = QGroupBox()
+        grp_act.setStyleSheet("QGroupBox { margin-top: 0px; padding-top: 0px; border: none; }")
+        v_act = QVBoxLayout(grp_act)
+        v_act.setContentsMargins(0, 0, 0, 0)
+        v_act.addWidget(w_act_title)
+
+        self.te_actividades = QTextEdit()
+        self.te_actividades.setReadOnly(True)
+        self.te_actividades.setMinimumHeight(120)
+        self.te_actividades.setStyleSheet(f"background:{C_BG}; color:{C_TEXT}; border: 1px solid {C_BORDER};")
+        v_act.addWidget(self.te_actividades)
+        v.addWidget(grp_act)
 
         # ── Observaciones ────────────────────────────────────
         grp_obs = QGroupBox("Observaciones del revisor")
@@ -842,6 +958,16 @@ class ReviewPanel(QWidget):
         checklist = report.get("checklist", [])
         self._build_checklist_rows(checklist)
 
+        # Resumen de actividades
+        fields = report.get("fields", {})
+        actividades = fields.get("actividades_resumen", "")
+        if actividades:
+            self.te_actividades.setPlainText(actividades)
+            self.te_actividades.setStyleSheet(f"background:{C_BG}; color:{C_TEXT}; border: 1px solid {C_BORDER};")
+        else:
+            self.te_actividades.setPlainText("No se identificó sección de actividades en el documento.")
+            self.te_actividades.setStyleSheet(f"background:{C_BG}; color:{C_MUTED}; border: 1px solid {C_BORDER}; font-style: italic;")
+
     def sync_to_report(self):
         """Copia los valores del panel al dict del informe."""
         if self._report is None:
@@ -903,6 +1029,7 @@ class MainWindow(QMainWindow):
         self._save_worker = None
         self._process_worker = None
         self._unsaved = False
+        self.current_report = None
         self._build()
 
     # ── UI ─────────────────────────────────────────────────
@@ -986,6 +1113,7 @@ class MainWindow(QMainWindow):
         self.review_panel = ReviewPanel(self.chk_firma, self.chk_id_oficial)
         self.review_panel.setMinimumWidth(380)
         self.review_panel.changed.connect(self._on_review_changed)
+        self.review_panel.field_locate_requested.connect(self._on_field_locate)
         splitter.addWidget(self.review_panel)
 
         splitter.setSizes([300, 700, 420])
@@ -1163,6 +1291,7 @@ class MainWindow(QMainWindow):
 
         self._current_idx = row
         report = self._reports[row]
+        self.current_report = report
         self.review_panel.load_report(report)
         
         pdf_path = report.get("path", "")
@@ -1172,7 +1301,23 @@ class MainWindow(QMainWindow):
             if os.path.exists(alt_path):
                 pdf_path = alt_path
                 
+        # Rehidratar fields si vienen de un .efias que no los guardó
+        if "fields" not in report and os.path.exists(pdf_path):
+            try:
+                import engine
+                self.status.showMessage("Extrayendo metadatos faltantes...", 0)
+                # Forzar refresco de la UI
+                QCoreApplication.processEvents()
+                text, pages_text = engine.extract_text(pdf_path)
+                report["text"] = text
+                report["fields"] = engine.extract_fields(text, pages_text)
+                # Recargar el panel con la nueva info
+                self.review_panel.load_report(report)
+            except Exception as e:
+                print(f"Error rehidratando fields: {e}")
+
         self.pdf_viewer.load_path(pdf_path)
+        self.pdf_viewer.clear_highlights()
         self.status.showMessage(f"Revisando: {report.get('filename', '')}", 0)
 
     def _on_review_changed(self):
@@ -1231,6 +1376,27 @@ class MainWindow(QMainWindow):
         lbl = getattr(self, attr, None)
         if lbl:
             lbl.setText(val)
+
+    def _on_field_locate(self, field_name: str):
+        """Maneja la solicitud de ubicar un campo en el PDF original."""
+        if not self.current_report:
+            return
+            
+        fields = self.current_report.get("fields", {})
+        locations = fields.get("field_locations", {})
+        
+        if field_name in locations:
+            loc = locations[field_name]
+            search_text = loc.get("search_text")
+            page = loc.get("page", -1)
+            
+            if search_text and page >= 0:
+                self.pdf_viewer.highlight_text(search_text, page)
+                self.status.showMessage(f"Localizado: {field_name}", 3000)
+            else:
+                self.status.showMessage(f"El campo '{field_name}' no fue extraído automáticamente.", 3000)
+        else:
+            self.status.showMessage(f"No hay metadatos de ubicación para '{field_name}'.", 3000)
 
     # ── Guardar / Cargar sesión ─────────────────────────────
 
